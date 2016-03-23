@@ -98,7 +98,7 @@ class Agents:
         cur.close()
 
 
-    def add_agent(self, sessionID, externalIP, delay, jitter, profile, killDate, workingHours):
+    def add_agent(self, sessionID, externalIP, delay, jitter, profile, killDate, workingHours,lostLimit):
         """
         Add an agent to the internal cache and database.
         """
@@ -123,14 +123,14 @@ class Agents:
         if len(parts) == 2:
             requestUris = parts[0]
             userAgent = parts[1]
-        elif len(parts) == 3:
+        elif len(parts) > 2:
             requestUris = parts[0]
             userAgent = parts[1]
-            additionalHeaders = parts[2]
+            additionalHeaders = "|".join(parts[2:])
 
-        cur.execute("INSERT INTO agents (name,session_id,delay,jitter,external_ip,session_key,checkin_time,lastseen_time,uris,user_agent,headers,kill_date,working_hours) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (sessionID,sessionID,delay,jitter,externalIP,sessionKey,checkinTime,lastSeenTime,requestUris,userAgent,additionalHeaders,killDate,workingHours))
+        cur.execute("INSERT INTO agents (name,session_id,delay,jitter,external_ip,session_key,checkin_time,lastseen_time,uris,user_agent,headers,kill_date,working_hours,lost_limit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (sessionID,sessionID,delay,jitter,externalIP,sessionKey,checkinTime,lastSeenTime,requestUris,userAgent,additionalHeaders,killDate,workingHours,lostLimit))
         cur.close()
-
+        
         # initialize the tasking/result buffers along with the client session key
         sessionKey = self.get_agent_session_key(sessionID)
         self.agents[sessionID] = [sessionKey, [],[],[], requestUris, ""]
@@ -195,6 +195,13 @@ class Agents:
         savePath =  self.installPath + "/downloads/"+str(sessionID)+"/" + "/".join(parts[0:-1])
         filename = parts[-1]
 
+        # fix for 'skywalker' exploit by @zeroSteiner
+        safePath = os.path.abspath("%s/downloads/%s/" %(self.installPath, sessionID))
+        if not os.path.abspath(savePath+"/"+filename).startswith(safePath):
+            dispatcher.send("[!] WARNING: agent %s attempted skywalker exploit!" %(sessionID), sender="Agents")
+            dispatcher.send("[!] attempted overwrite of %s with data %s" %(path, data), sender="Agents")
+            return
+
         # make the recursive directory structure if it doesn't already exist
         if not os.path.exists(savePath):
             os.makedirs(savePath)
@@ -210,7 +217,7 @@ class Agents:
         f.close()
 
         # notify everyone that the file was downloaded
-        dispatcher.send("[+] Part of file "+filename+" from "+str(sessionID)+" saved", sender="Agents")
+        dispatcher.send("[+] Part of file %s from %s saved" %(filename, sessionID), sender="Agents")
     
 
     def save_module_file(self, sessionID, path, data):
@@ -226,6 +233,13 @@ class Agents:
         # construct the appropriate save path
         savePath =  self.installPath + "/downloads/"+str(sessionID)+"/" + "/".join(parts[0:-1])
         filename = parts[-1]
+
+        # fix for 'skywalker' exploit by @zeroSteiner
+        safePath = os.path.abspath("%s/downloads/%s/" %(self.installPath, sessionID))
+        if not os.path.abspath(savePath+"/"+filename).startswith(safePath):
+            dispatcher.send("[!] WARNING: agent %s attempted skywalker exploit!" %(sessionID), sender="Agents")
+            dispatcher.send("[!] attempted overwrite of %s with data %s" %(path, data), sender="Agents")
+            return
 
         # make the recursive directory structure if it doesn't already exist
         if not os.path.exists(savePath):
@@ -460,7 +474,83 @@ class Agents:
         else:
             return None
 
+    def get_agent_functions(self, sessionID):
+        """
+        Get the tab-completable functions for an agent.
+        """
 
+        # see if we were passed a name instead of an ID
+        nameid = self.get_agent_id(sessionID)
+        if nameid : sessionID = nameid
+
+        if sessionID in self.agents:
+            return self.agents[sessionID][3]
+        else:
+            return []
+
+
+    def get_agent_functions_database(self, sessionID):
+        """
+        Get the tab-completable functions for an agent from the database.
+        """
+
+        # see if we were passed a name instead of an ID
+        nameid = self.get_agent_id(sessionID)
+        if nameid : sessionID = nameid
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT functions FROM agents WHERE session_id=?", [sessionID])
+        functions = cur.fetchone()[0]
+        cur.close()
+        if functions and functions != None:
+            return functions.split(",")
+        else:
+            return []
+
+
+    def get_agent_uris(self, sessionID):
+        """
+        Get the current and old URIs for an agent from the database.
+        """
+
+        # see if we were passed a name instead of an ID
+        nameid = self.get_agent_id(sessionID)
+        if nameid : sessionID = nameid
+
+        cur = self.conn.cursor()
+        cur.execute("SELECT uris, old_uris FROM agents WHERE session_id=?", [sessionID])
+        uris = cur.fetchone()
+        cur.close()
+
+        return uris
+
+
+    def get_autoruns(self):
+        """
+        Get any global script autoruns.
+        """
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT autorun_command FROM config")
+            results = cur.fetchone()
+            if results:
+                autorunCommand = results[0]
+            else:
+                autorunCommand = ''
+
+            cur = self.conn.cursor()
+            cur.execute("SELECT autorun_data FROM config")
+            results = cur.fetchone()
+            if results:
+                autorunData = results[0]
+            else:
+                autorunData = ''
+            cur.close()
+
+            return [autorunCommand, autorunData]
+        except:
+            pass
 
     ###############################################################
     #
@@ -615,55 +705,34 @@ class Agents:
         cur.close()
 
 
-    def get_agent_functions(self, sessionID):
+    def set_autoruns(self, taskCommand, moduleData):
         """
-        Get the tab-completable functions for an agent.
-        """
-
-        # see if we were passed a name instead of an ID
-        nameid = self.get_agent_id(sessionID)
-        if nameid : sessionID = nameid
-
-        if sessionID in self.agents:
-            return self.agents[sessionID][3]
-        else:
-            return []
-
-
-    def get_agent_functions_database(self, sessionID):
-        """
-        Get the tab-completable functions for an agent from the database.
+        Set the global script autorun in the config.
         """
 
-        # see if we were passed a name instead of an ID
-        nameid = self.get_agent_id(sessionID)
-        if nameid : sessionID = nameid
-
-        cur = self.conn.cursor()
-        cur.execute("SELECT functions FROM agents WHERE session_id=?", [sessionID])
-        functions = cur.fetchone()[0]
-        cur.close()
-        if functions and functions != None:
-            return functions.split(",")
-        else:
-            return []
+        try:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE config SET autorun_command=?", [taskCommand])
+            cur.execute("UPDATE config SET autorun_data=?", [moduleData])
+            cur.close()
+        except:
+            print helpers.color("[!] Error: script autoruns not a database field, run ./setup_database.py to reset DB schema.")
+            print helpers.color("[!] Warning: this will reset ALL agent connections!")
 
 
-    def get_agent_uris(self, sessionID):
+    def clear_autoruns(self):
         """
-        Get the current and old URIs for an agent from the database.
+        Clear the currently set global script autoruns in the config.
         """
 
-        # see if we were passed a name instead of an ID
-        nameid = self.get_agent_id(sessionID)
-        if nameid : sessionID = nameid
-
-        cur = self.conn.cursor()
-        cur.execute("SELECT uris, old_uris FROM agents WHERE session_id=?", [sessionID])
-        uris = cur.fetchone()
-        cur.close()
-
-        return uris
+        try:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE config SET autorun_command=''")
+            cur.execute("UPDATE config SET autorun_data=''")
+            cur.close()
+        except:
+            print helpers.color("[!] Error: script autoruns not a database field, run ./setup_database.py to reset DB schema.")
+            print helpers.color("[!] Warning: this will reset ALL agent connections!")
 
 
     ###############################################################
@@ -689,6 +758,12 @@ class Agents:
             if sessionID:
                 dispatcher.send("[*] Tasked " + str(sessionID) + " to run " + str(taskName), sender="Agents")
                 self.agents[sessionID][1].append([taskName, task])
+
+                # write out the last tasked script to "LastTask.ps1" if in debug mode
+                if self.args and self.args.debug:
+                    f = open(self.installPath + '/LastTask.ps1', 'w')
+                    f.write(task)
+                    f.close()
 
                 # report the agent tasking in the reporting database
                 cur = self.conn.cursor()
@@ -892,6 +967,21 @@ class Agents:
 
             # dynamic script output -> blocking
             self.update_agent_results(sessionID, data)
+
+            # see if there are any credentials to parse
+            time = helpers.get_datetime()
+            creds = helpers.parse_credentials(data)
+
+            if(creds):
+                for cred in creds:
+
+                    hostname = cred[4]
+                    
+                    if hostname == "":
+                        hostname = self.get_agent_hostname(sessionID)
+
+                    self.mainMenu.credentials.add_credential(cred[0], cred[1], cred[2], cred[3], hostname, cred[5], time)
+
             # update the agent log
             self.save_agent_log(sessionID, data)
 
@@ -938,8 +1028,8 @@ class Agents:
                         hostname = cred[4]
                         
                         if hostname == "":
-                            hostname = self.get_agent_hostname(sessionID
-                                )
+                            hostname = self.get_agent_hostname(sessionID)
+
                         self.mainMenu.credentials.add_credential(cred[0], cred[1], cred[2], cred[3], hostname, cred[5], time)
 
 
@@ -1052,7 +1142,7 @@ class Agents:
                 dispatcher.send("[*] Sending stager (stage 1) to "+str(clientIP), sender="Agents")
 
             # get the staging information for the given listener, keyed by port
-            #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours,istener_type,redirect_target
+            #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours,istener_type,redirect_target,lost_limit
             config = self.listeners.get_staging_information(port=port)
             host = config[0]
             stagingkey = config[3]
@@ -1124,21 +1214,28 @@ class Agents:
 
                     counter = responsePackets[-1][1]
 
-                    # validate the counter in the packet in the set
+                    results = False
+
+                    # validate the counter in the packet in the setcode.replace
                     if counter and packets.validate_counter(counter):
-                        
+
+                        results = True
+
+                        # process each result packet                        
                         for responsePacket in responsePackets:
                             (responseName, counter, length, data) = responsePacket
+
                             # process the agent's response
                             self.handle_agent_response(sessionID, responseName, data)
 
-                        # signal that this agent returned results
-                        name = self.get_agent_name(sessionID)
-                        dispatcher.send("[*] Agent "+str(name)+" returned results.", sender="Agents")
+                        if results:
+                            # signal that this agent returned results
+                            name = self.get_agent_name(sessionID)
+                            dispatcher.send("[*] Agent "+str(name)+" returned results.", sender="Agents")
 
                         # return a 200/valid
                         return (200, "")
-
+                            
                     else:
                         dispatcher.send("[!] Invalid counter value from "+str(sessionID), sender="Agents")
                         return (404, "")
@@ -1155,7 +1252,7 @@ class Agents:
                 dispatcher.send("[*] Agent "+str(sessionID)+" from "+str(clientIP)+" posted to public key URI", sender="Agents")
 
             # get the staging key for the given listener, keyed by port
-            #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours 
+            #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours,lost_limit
             stagingKey = self.listeners.get_staging_information(port=port)[3]
 
             # decrypt the agent's public key
@@ -1180,16 +1277,17 @@ class Agents:
                     epoch = packets.get_counter()
 
                     # get the staging key for the given listener, keyed by port
-                    #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours 
+                    #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours,listener_type,redirect_target,default_lost_limit
                     config = self.listeners.get_staging_information(port=port)
                     delay = config[4]
                     jitter = config[5]
                     profile = config[6]
                     killDate = config[7]
                     workingHours = config[8]
+                    lostLimit = config[11]
 
                     # add the agent to the database now that it's "checked in"
-                    self.add_agent(sessionID, clientIP, delay, jitter, profile, killDate, workingHours)
+                    self.add_agent(sessionID, clientIP, delay, jitter, profile, killDate, workingHours,lostLimit)
 
                     # step 4 of negotiation -> return epoch+aes_session_key
                     clientSessionKey = self.get_agent_session_key(sessionID)
@@ -1218,7 +1316,7 @@ class Agents:
                         decoded = helpers.decode_base64(parts[1])
 
                         # get the staging key for the given listener, keyed by port
-                        #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours 
+                        #   results: host,port,cert_path,staging_key,default_delay,default_jitter,default_profile,kill_date,working_hours,lost_limit 
                         config = self.listeners.get_staging_information(host=decoded)
 
                 else:
@@ -1229,6 +1327,7 @@ class Agents:
                 profile = config[6]
                 killDate = config[7]
                 workingHours = config[8]
+                lostLimit = config[11]
 
                 # get the session key for the agent
                 sessionKey = self.agents[sessionID][0]
@@ -1240,7 +1339,8 @@ class Agents:
                     parts = data.split("|")
 
                     if len(parts) < 10:
-                        dispatcher.send("[!] Agent "+str(sessionID)+" posted invalid sysinfo checkin format", sender="Agents")
+                        dispatcher.send("[!] Agent %s posted invalid sysinfo checkin format: %s" %(sessionID, data), sender="Agents")
+
                         # remove the agent from the cache/database
                         self.remove_agent(sessionID)
                         return (404, "")
@@ -1272,7 +1372,7 @@ class Agents:
                     dispatcher.send("[*] Sending agent (stage 2) to "+str(sessionID)+" at "+clientIP, sender="Agents")
 
                 # step 6 of negotiation -> server sends patched agent.ps1
-                agentCode = self.stagers.generate_agent(delay, jitter, profile, killDate, workingHours)
+                agentCode = self.stagers.generate_agent(delay, jitter, profile, killDate,workingHours,lostLimit)
 
                 username = str(domainname)+"\\"+str(username)
 
@@ -1289,7 +1389,8 @@ class Agents:
                 # set basic initial information to display for the agent
                 agent = self.mainMenu.agents.get_agent(sessionID)
 
-                keys = ["ID", "sessionID", "listener", "name", "delay", "jitter", "external_ip", "internal_ip", "username", "high_integrity", "process_name", "process_id", "hostname", "os_details", "session_key", "checkin_time", "lastseen_time", "parent", "children", "servers", "uris", "old_uris", "user_agent", "headers", "functions", "kill_date", "working_hours", "ps_version"]
+                keys = ["ID", "sessionID", "listener", "name", "delay", "jitter","external_ip", "internal_ip", "username", "high_integrity", "process_name", "process_id", "hostname", "os_details", "session_key", "checkin_time", "lastseen_time", "parent", "children", "servers", "uris", "old_uris", "user_agent", "headers", "functions", "kill_date", "working_hours", "ps_version", "lost_limit"]
+
                 agentInfo = dict(zip(keys, agent))
 
                 for key in agentInfo:
@@ -1298,6 +1399,11 @@ class Agents:
 
                 # save the initial sysinfo information in the agent log
                 self.save_agent_log(sessionID, output + "\n")
+
+                # if a script autorun is set, set that as the agent's first tasking
+                autorun = self.get_autoruns()
+                if autorun and autorun[0] != '' and autorun[1] != '':
+                    self.add_agent_task(sessionID, autorun[0], autorun[1])
 
                 return(200, encryptedAgent)
 
@@ -1308,4 +1414,3 @@ class Agents:
         # default behavior, 404
         else:
             return (404, "")
-

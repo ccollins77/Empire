@@ -184,17 +184,130 @@ def parse_powershell_script(data):
 
 def strip_powershell_comments(data):
     """
-    Strip block comments, line comments, and emtpy lines from a
-    PowerShell file.
+    Strip block comments, line comments, empty lines, verbose statements,
+    and debug statements from a PowerShell source file.
     """
     
     # strip block comments
     strippedCode = re.sub(re.compile('<#.*?#>', re.DOTALL), '', data)
 
-    # strip blank lines and lines starting with #
-    strippedCode = "\n".join([line for line in strippedCode.split('\n') if ((line.strip() != '') and (not line.strip().startswith("#")))])
+    # strip blank lines, lines starting with #, and verbose/debug statements
+    strippedCode = "\n".join([line for line in strippedCode.split('\n') if ((line.strip() != '') and (not line.strip().startswith("#")) and (not line.strip().lower().startswith("write-verbose ")) and (not line.strip().lower().startswith("write-debug ")) )])
     
     return strippedCode
+
+
+# PowerView dynamic helpers
+
+def get_powerview_psreflect_overhead(script):
+    """
+    Helper to extract some of the psreflect overhead for PowerView.
+    """
+    pattern = re.compile(r'\n\$Mod =.*\[\'wtsapi32\'\]', re.DOTALL)
+    
+    try:
+        return strip_powershell_comments(pattern.findall(script)[0])
+    except:
+        print color("[!] Error extracting psreflect overhead from powerview.ps1 !")
+        return ""
+
+
+def get_dependent_functions(code, functionNames):
+    """
+    Helper that takes a chunk of PowerShell code and a set of function 
+    names and returns the unique set of function names within the script block.
+    """
+
+    dependentFunctions = set()
+    for functionName in functionNames:
+        # find all function names that aren't followed by another alpha character
+        if re.search("[^A-Za-z']+"+functionName+"[^A-Za-z']+", code, re.IGNORECASE):
+            dependentFunctions.add(functionName)
+
+    if re.search("\$Netapi32|\$Advapi32|\$Kernel32\$Wtsapi32", code, re.IGNORECASE):
+        dependentFunctions |= set(["New-InMemoryModule", "func", "Add-Win32Type", "psenum", "struct"])
+
+    return dependentFunctions
+
+
+def find_all_dependent_functions(functions, functionsToProcess, resultFunctions=[]):
+    """
+    Takes a dictionary of "[functionName] -> functionCode" and a set of functions
+    to process, and recursively returns all nested functions that may be required.
+
+    Used to map the dependent functions for nested script dependencies like in
+    PowerView.
+    """
+
+    if isinstance(functionsToProcess, str):
+        functionsToProcess = [functionsToProcess]
+
+    while len(functionsToProcess) != 0:
+
+        # pop the next function to process off the stack
+        requiredFunction = functionsToProcess.pop()
+
+        if requiredFunction not in resultFunctions:
+            resultFunctions.append(requiredFunction)
+
+        # get the dependencies for the function we're currently processing
+        try:
+            functionDependencies = get_dependent_functions(functions[requiredFunction], functions.keys())
+        except:
+            functionDependencies = []
+            print color("[!] Error in retrieving dependencies for function %s !" %(requiredFunction))
+
+        for functionDependency in functionDependencies:
+            if functionDependency not in resultFunctions and functionDependency not in functionsToProcess:
+                # for each function dependency, if we haven't already seen it
+                #   add it to the stack for processing
+                functionsToProcess.append(functionDependency)
+                resultFunctions.append(functionDependency)
+
+        resultFunctions = find_all_dependent_functions(functions, functionsToProcess, resultFunctions)
+
+    return resultFunctions
+
+
+def generate_dynamic_powershell_script(script, functionName):
+    """
+    Takes a PowerShell script and a function name, generates a dictionary
+    of "[functionName] -> functionCode", and recurisvely maps all 
+    dependent functions for the specified function name.
+
+    A script is returned with only the code necessary for the given
+    functionName, stripped of comments and whitespace.
+
+    Note: for PowerView, it will also dynamically detect if psreflect 
+    overhead is needed and add it to the result script.
+    """
+
+    newScript = ""
+    psreflect_functions = ["New-InMemoryModule", "func", "Add-Win32Type", "psenum", "struct"]
+
+    # build a mapping of functionNames -> stripped function code
+    functions = {}
+    pattern = re.compile(r'\nfunction.*?{.*?\n}\n', re.DOTALL)
+
+    for match in pattern.findall(script):
+        name = match[:40].split()[1]
+        functions[name] = strip_powershell_comments(match)
+
+    # recursively enumerate all possible function dependencies and
+    #   start building the new result script
+    functionDependencies = find_all_dependent_functions(functions, functionName, [])
+
+    for functionDependency in functionDependencies:
+        try:
+            newScript += functions[functionDependency] + "\n"
+        except:
+            print color("[!] Key error with function %s !" %(functionDependency))
+
+    # if any psreflect methods are needed, add in the overhead at the end
+    if any(el in set(psreflect_functions) for el in functionDependencies):
+        newScript += get_powerview_psreflect_overhead(script)
+
+    return newScript + "\n"
 
 
 ###############################################################
@@ -202,6 +315,42 @@ def strip_powershell_comments(data):
 # Parsers
 #
 ###############################################################
+
+def parse_credentials(data):
+    """
+    Parse module output, looking for any parseable sections.
+    """
+
+    parts = data.split("\n")
+
+    # tag for Invoke-Mimikatz output
+    if parts[0].startswith("Hostname:"):
+        return parse_mimikatz(data)
+
+    # collection/prompt output
+    elif parts[0].startswith("[+] Prompted credentials:"):
+        
+        parts = parts[0].split("->")
+        if len(parts) == 2:
+            
+            username = parts[1].split(":",1)[0].strip()
+            password = parts[1].split(":",1)[1].strip()
+
+            if "\\" in username:
+                domain = username.split("\\")[0].strip()
+                username = username.split("\\")[1].strip()
+            else:
+                domain = ""
+            
+            return [("plaintext", domain, username, password, "", "")]
+
+        else:
+            print color("[!] Error in parsing prompted credential output.")
+            return None
+
+    else:
+        return None
+
 
 def parse_mimikatz(data):
     """
@@ -244,11 +393,11 @@ def parse_mimikatz(data):
             for line in lines2:
                 try:
                     if "Username" in line:
-                        username = line.split(":")[1].strip()
+                        username = line.split(":",1)[1].strip()
                     elif "Domain" in line:
-                        domain = line.split(":")[1].strip()
+                        domain = line.split(":",1)[1].strip()
                     elif "NTLM" in line or "Password" in line:
-                        password = line.split(":")[1].strip()
+                        password = line.split(":",1)[1].strip()
                 except:
                     pass
 
@@ -271,32 +420,56 @@ def parse_mimikatz(data):
                 if not (credType == "plaintext" and username.endswith("$")):
                     creds.append((credType, domain, username, password, hostName, sid))
 
-    # check if we have lsadump output to check for krbtgt
-    #   happens on domain controller hashdumps
-    for x in xrange(8,13):
-        if lines[x].startswith("Domain :"):
+    if len(creds) == 0:
+        # check if we have lsadump output to check for krbtgt
+        #   happens on domain controller hashdumps
+        for x in xrange(8,13):
+            if lines[x].startswith("Domain :"):
 
-            domain, sid, krbtgtHash = "", "", ""
+                domain, sid, krbtgtHash = "", "", ""
 
-            try:
-                domainParts = lines[x].split(":")[1]
-                domain = domainParts.split("/")[0].strip()
-                sid = domainParts.split("/")[1].strip()
+                try:
+                    domainParts = lines[x].split(":")[1]
+                    domain = domainParts.split("/")[0].strip()
+                    sid = domainParts.split("/")[1].strip()
 
-                # substitute the FQDN in if it matches
-                if hostDomain.startswith(domain.lower()):
-                    domain = hostDomain
-                    sid = domainSid
+                    # substitute the FQDN in if it matches
+                    if hostDomain.startswith(domain.lower()):
+                        domain = hostDomain
+                        sid = domainSid
 
-                for x in xrange(0, len(lines)):
-                    if lines[x].startswith("User : krbtgt"):
-                        krbtgtHash = lines[x+2].split(":")[1].strip()
-                        break
+                    for x in xrange(0, len(lines)):
+                        if lines[x].startswith("User : krbtgt"):
+                            krbtgtHash = lines[x+2].split(":")[1].strip()
+                            break
 
-                if krbtgtHash != "":
-                    creds.append(("hash", domain, "krbtgt", krbtgtHash, hostName, sid))
-            except Exception as e:
-                pass
+                    if krbtgtHash != "":
+                        creds.append(("hash", domain, "krbtgt", krbtgtHash, hostName, sid))
+                except Exception as e:
+                    pass
+
+    if len(creds) == 0:
+        # check if we get lsadump::dcsync output
+        if '** SAM ACCOUNT **' in lines:
+            domain, user, userHash, dcName, sid = "", "", "", "", ""
+            for line in lines:
+                try:
+                    if line.strip().endswith("will be the domain"):
+                        domain = line.split("'")[1]
+                    elif line.strip().endswith("will be the DC server"):
+                        dcName = line.split("'")[1].split(".")[0]
+                    elif line.strip().startswith("SAM Username"):
+                        user = line.split(":")[1].strip()
+                    elif line.strip().startswith("Object Security ID"):
+                        parts = line.split(":")[1].strip().split("-")
+                        sid = "-".join(parts[0:-1])
+                    elif line.strip().startswith("Hash NTLM:"):
+                        userHash = line.split(":")[1].strip()
+                except:
+                    pass
+
+            if domain != "" and userHash != "":
+                creds.append(("hash", domain, user, userHash, dcName, sid))
 
     return uniquify_tuples(creds)
 
@@ -352,19 +525,32 @@ def lhost():
         import fcntl
         import struct
         def get_interface_ip(ifname):
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            return socket.inet_ntoa(fcntl.ioctl(
-                    s.fileno(),
-                    0x8915,  # SIOCGIFADDR
-                    struct.pack('256s', ifname[:15])
-                )[20:24])
-    ip = socket.gethostbyname(socket.gethostname())
-    if ip.startswith("127.") and os.name != "nt":
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                return socket.inet_ntoa(fcntl.ioctl(
+                        s.fileno(),
+                        0x8915,  # SIOCGIFADDR
+                        struct.pack('256s', ifname[:15])
+                    )[20:24])
+            except IOError as e:
+                return ""
+
+    ip = ""
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except socket.gaierror:
+        pass
+    except:
+        print "Unexpected error:", sys.exc_info()[0]
+        return ip
+
+    if (ip == "" or ip.startswith("127.")) and os.name != "nt":
         interfaces = ["eth0","eth1","eth2","wlan0","wlan1","wifi0","ath0","ath1","ppp0"]
         for ifname in interfaces:
             try:
                 ip = get_interface_ip(ifname)
-                break
+                if ip != "":
+                    break
             except:
                 print "Unexpected error:", sys.exc_info()[0]
                 pass
@@ -390,13 +576,13 @@ def color(string, color=None):
         return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
 
     else:
-        if string.startswith("[!]"):
+        if string.strip().startswith("[!]"):
             attr.append('31')
             return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
-        elif string.startswith("[+]"):
+        elif string.strip().startswith("[+]"):
             attr.append('32')
             return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
-        elif string.startswith("[*]"):
+        elif string.strip().startswith("[*]"):
             attr.append('34')
             return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
         else:
@@ -493,4 +679,3 @@ def complete_path(text, line, arg=False):
                     completions.append(f+'/')
 
     return completions
-

@@ -23,7 +23,7 @@ builds tasking packets and parses result packets
 """
 
 
-import struct, time
+import struct, time, base64
 
 
 # 0         -> error
@@ -103,8 +103,7 @@ def build_task_packet(taskName, data):
     counter = struct.pack('=L', get_counter())
     length = struct.pack('=L',len(data))
 
-    # data.encode('ascii',errors='ignore')
-    return taskID + counter + length + data.encode('ascii',errors='ignore')
+    return taskID + counter + length + data.decode('utf-8').encode('utf-8',errors='ignore')
    
 
 def parse_result_packet(packet, offset=0):
@@ -117,7 +116,11 @@ def parse_result_packet(packet, offset=0):
         responseID = struct.unpack('=L', packet[0+offset:4+offset])[0]
         counter = struct.unpack('=L', packet[4+offset:8+offset])[0]
         length = struct.unpack('=L', packet[8+offset:12+offset])[0]
-        data = packet[12+offset:12+offset+length]
+        data = base64.b64decode(packet[12+offset:12+offset+length])
+        #if isinstance(data, unicode):
+        #    print "UNICODE DATA"
+        #elif isinstance(data, str):
+        #    print "ASCII / UTF8"
         remainingData = packet[12+offset+length:]
         return (PACKET_IDS[responseID], counter, length, data, remainingData)
     except:

